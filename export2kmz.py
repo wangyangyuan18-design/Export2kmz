@@ -926,9 +926,10 @@ class ExportDialog(QDialog):
                 except Exception as exc:
                     QMessageBox.warning(self, "KMZ导出工具", str(exc))
                     return
+        homes_group_summary = None
         if self.sum_homes_units.isChecked():
             try:
-                _homes_group_summary(selected)
+                homes_group_summary = _homes_group_summary(selected)
             except Exception as exc:
                 QMessageBox.warning(self, "KMZ导出工具", str(exc))
                 return
@@ -940,7 +941,7 @@ class ExportDialog(QDialog):
         try:
             count, geometry_stats = export_kmz(
                 path, selected, self.attrs.isChecked(), progress,
-                sum_homes_units=self.sum_homes_units.isChecked()
+                homes_group_summary=homes_group_summary
             )
             progress.setValue(100)
             progress.setLabelText("KMZ 文件已生成。")
@@ -957,7 +958,7 @@ class ExportDialog(QDialog):
             QMessageBox.critical(self, "导出失败", str(exc))
 
 def export_kmz(output_path, selected, include_attributes=True, progress=None,
-               sum_homes_units=False):
+               homes_group_summary=None):
     doc = ET.Element(qn("kml"))
     document = ET.SubElement(doc, qn("Document"))
     add_text(document, "name", os.path.basename(output_path))
@@ -969,7 +970,7 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None,
     geometry_stats = {"point": 0, "line": 0, "polygon": 0}
     folder_cache = {}
     homes_group_path, homes_units_total = (
-        _homes_group_summary(selected) if sum_homes_units else ((), None)
+        homes_group_summary if homes_group_summary is not None else ((), None)
     )
     if progress:
         progress.setValue(0)
