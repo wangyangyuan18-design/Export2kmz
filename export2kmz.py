@@ -186,10 +186,7 @@ def _format_number(value):
     number = value if isinstance(value, Decimal) else Decimal(str(value))
     if not number.is_finite():
         raise ValueError("统计结果不是有限数值。")
-    normalized = number.normalize()
-    if normalized == normalized.to_integral_value():
-        return format(normalized.quantize(Decimal("1")), "f")
-    return format(normalized, "f")
+    return format(number.normalize(), "f")
 
 
 def _sum_field(layer, field_name):
@@ -520,12 +517,12 @@ class ExportDialog(QDialog):
                 lambda index, r=row: self.update_status(r, index))
             style.currentIndexChanged.connect(self._save_project_config)
             group.currentIndexChanged.connect(self._save_project_config)
-            icon.currentIndexChanged.connect(self._save_project_config)
 
             icon = QComboBox()
             icon.addItems(["默认", "空心圆环", "圆点", "方形"])
             icon.setEnabled(QgsWkbTypes.geometryType(layer.wkbType()) == QgsWkbTypes.PointGeometry)
             self.table.setCellWidget(row, 9, icon)
+            icon.currentIndexChanged.connect(self._save_project_config)
 
             desc = QComboBox()
             desc.addItem("(不添加说明)", "")
