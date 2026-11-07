@@ -169,7 +169,7 @@ _HOMES_SUM_LAYER_NAMES = (
 
 
 def _homes_group_summary():
-    """Return (common parent group path, total UNITS) for the six selected HOMES layers."""
+    """Return the common parent group path and total UNITS for the six project HOMES layers."""
     by_name = {}
     target_names = {name.casefold() for name in _HOMES_SUM_LAYER_NAMES}
     for layer in _layer_tree_layers():
