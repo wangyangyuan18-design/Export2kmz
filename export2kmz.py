@@ -169,47 +169,75 @@ _HOMES_SUM_LAYER_NAMES = (
 
 
 def _homes_group_summary():
-    """Return the common parent group path and total UNITS for the six project HOMES layers."""
-    by_name = {}
+    """Find the deepest existing group containing one of each HOMES layer and sum UNITS."""
+    root = QgsProject.instance().layerTreeRoot()
     target_names = {name.casefold() for name in _HOMES_SUM_LAYER_NAMES}
-    for layer in _layer_tree_layers():
-        key = layer.name().strip().casefold()
-        if key in target_names:
-            by_name.setdefault(key, []).append(layer)
+    candidates = []
 
-    layers = []
-    missing = []
-    for name in _HOMES_SUM_LAYER_NAMES:
-        matches = by_name.get(name.casefold(), [])
-        if len(matches) != 1:
-            missing.append(name if not matches else "{}（存在多个同名图层）".format(name))
-        else:
-            layers.append(matches[0])
-    if missing:
+    def group_path(group):
+        names = []
+        parent = group
+        while parent is not None and parent.parent() is not None:
+            names.append(parent.name())
+            parent = parent.parent()
+        names.reverse()
+        return tuple(names)
+
+    def descendant_layers(group):
+        found = {name: [] for name in target_names}
+
+        def walk(node):
+            if hasattr(node, "layer") and callable(node.layer):
+                layer = node.layer()
+                if isinstance(layer, QgsVectorLayer) and layer.isValid():
+                    key = layer.name().strip().casefold()
+                    if key in found:
+                        found[key].append(layer)
+            if hasattr(node, "children"):
+                for child in node.children():
+                    walk(child)
+
+        for child in group.children():
+            walk(child)
+        return found
+
+    def inspect_groups(node):
+        # The root is not an exportable named folder; inspect named groups only.
+        if node is not root and hasattr(node, "children") and callable(node.children):
+            found = descendant_layers(node)
+            if all(len(found[name.casefold()]) == 1 for name in _HOMES_SUM_LAYER_NAMES):
+                path = group_path(node)
+                candidates.append((len(path), path, [
+                    found[name.casefold()][0] for name in _HOMES_SUM_LAYER_NAMES
+                ]))
+        if hasattr(node, "children"):
+            for child in node.children():
+                inspect_groups(child)
+
+    inspect_groups(root)
+    if not candidates:
         raise ValueError(
-            "已勾选“汇总 UNITS 字段”，但工程中以下 HOMES 图层不存在或存在重名：{}。"
-            "请确认六个图层名称唯一且均位于工程中。".format("、".join(missing))
+            "已勾选“汇总 UNITS 字段”，但没有找到一个现有 QGIS 组，"
+            "其中恰好包含 Sdus、Mdus、Church、Commercial、Hospitals、Institution "
+            "各一个图层。请检查六个图层是否位于同一个组内。"
         )
 
-    paths = [_layer_tree_path(layer) for layer in layers]
-    common = list(paths[0])
-    for path in paths[1:]:
-        limit = min(len(common), len(path))
-        index = 0
-        while index < limit and common[index] == path[index]:
-            index += 1
-        common = common[:index]
-    if not common:
+    deepest = max(item[0] for item in candidates)
+    best = [item for item in candidates if item[0] == deepest]
+    if len(best) != 1:
+        paths = [" / ".join(item[1]) for item in best]
         raise ValueError(
-            "六个 HOMES 图层没有共同的 QGIS 父组，无法给现有文件夹名称追加汇总值。"
+            "工程中找到多个同层级、均包含完整 HOMES 六图层的组，无法自动判断要汇总哪一个：{}。"
+            "请确认只保留一个目标组，或调整图层树结构。".format("；".join(paths))
         )
 
+    _, group_path_value, layers = best[0]
     total = Decimal("0")
     with localcontext() as context:
         context.prec = 50
         for layer in layers:
             total += Decimal(_sum_field(layer, "UNITS"))
-    return tuple(common), _format_number(total)
+    return tuple(group_path_value), _format_number(total)
 
 
 def _ensure_kml_folder(parent, name, cache):
