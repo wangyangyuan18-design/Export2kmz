@@ -21,7 +21,7 @@ Each layer can independently use one of three modes:
 - **Field sum**: `LayerName=1010`
 - **No statistic**: `LayerName`
 
-There is no forced HOMES `UNITS` sum. Select the required numeric field separately for each layer. The separate **汇总 UNITS 字段** checkbox is an optional project-specific group summary and is off by default. When enabled, all six HOMES layers must be selected for export and share an existing parent group. The SUB BOX Type classification remains available.
+There is no forced HOMES `UNITS` sum. Select the required numeric field separately for each layer. The separate **汇总 UNITS 字段** checkbox is an optional project-specific group summary and is off by default. When enabled, all six HOMES layers must exist uniquely in the project and share an existing parent group; their UNITS values are summed even if some are not selected for export. The SUB BOX Type classification remains available.
 
 ## Installation
 Download the latest `Export2kmz.zip` from the repository's **Releases** page. Extract the ZIP into your QGIS profile's `python/plugins/` directory so that the `Export2kmz` folder is directly inside `python/plugins/`. Restart QGIS and enable Export2KMZ in Plugins → Manage and Install Plugins.
