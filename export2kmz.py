@@ -3,7 +3,7 @@
 import os
 import math
 import json
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
@@ -186,7 +186,10 @@ def _format_number(value):
     number = value if isinstance(value, Decimal) else Decimal(str(value))
     if not number.is_finite():
         raise ValueError("统计结果不是有限数值。")
-    return format(number.normalize(), "f")
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def _sum_field(layer, field_name):
@@ -195,18 +198,20 @@ def _sum_field(layer, field_name):
     if not actual:
         raise ValueError("图层“{}”不存在求和字段“{}”。".format(layer.name(), field_name))
     total, invalid = Decimal("0"), 0
-    for feature in layer.getFeatures():
-        value = feature[actual]
-        if value is None or str(value).strip() == "":
-            continue
-        try:
-            number = Decimal(str(value).strip())
-            if number.is_finite():
-                total += number
-            else:
+    with localcontext() as context:
+        context.prec = 50
+        for feature in layer.getFeatures():
+            value = feature[actual]
+            if value is None or str(value).strip() == "":
+                continue
+            try:
+                number = Decimal(str(value).strip())
+                if number.is_finite():
+                    total += number
+                else:
+                    invalid += 1
+            except (InvalidOperation, TypeError, ValueError):
                 invalid += 1
-        except (InvalidOperation, TypeError, ValueError):
-            invalid += 1
     if invalid:
         raise ValueError("图层“{}”字段“{}”包含 {} 个非数值内容。".format(layer.name(), actual, invalid))
     return _format_number(total)
