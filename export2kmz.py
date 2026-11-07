@@ -926,6 +926,12 @@ class ExportDialog(QDialog):
                 except Exception as exc:
                     QMessageBox.warning(self, "KMZ导出工具", str(exc))
                     return
+        if self.sum_homes_units.isChecked():
+            try:
+                _homes_group_summary(selected)
+            except Exception as exc:
+                QMessageBox.warning(self, "KMZ导出工具", str(exc))
+                return
         self._save_project_config()
 
         progress = ExportProgressDialog(self)
