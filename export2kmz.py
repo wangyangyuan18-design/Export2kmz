@@ -168,12 +168,11 @@ _HOMES_SUM_LAYER_NAMES = (
 )
 
 
-def _homes_group_summary(selected):
+def _homes_group_summary():
     """Return (common parent group path, total UNITS) for the six selected HOMES layers."""
     by_name = {}
     target_names = {name.casefold() for name in _HOMES_SUM_LAYER_NAMES}
-    for item in selected:
-        layer = item["layer"]
+    for layer in _layer_tree_layers():
         key = layer.name().strip().casefold()
         if key in target_names:
             by_name.setdefault(key, []).append(layer)
@@ -188,8 +187,8 @@ def _homes_group_summary(selected):
             layers.append(matches[0])
     if missing:
         raise ValueError(
-            "已勾选“汇总 UNITS 字段”，但以下 HOMES 图层未被唯一选中：{}。"
-            "请确认六个图层均已启用导出，且名称唯一。".format("、".join(missing))
+            "已勾选“汇总 UNITS 字段”，但工程中以下 HOMES 图层不存在或存在重名：{}。"
+            "请确认六个图层名称唯一且均位于工程中。".format("、".join(missing))
         )
 
     paths = [_layer_tree_path(layer) for layer in layers]
@@ -461,8 +460,8 @@ class ExportDialog(QDialog):
         self.sum_homes_units = QCheckBox("汇总 UNITS 字段")
         self.sum_homes_units.setChecked(False)
         self.sum_homes_units.setToolTip(
-            "手动启用后，汇总 Sdus、Mdus、Church、Commercial、Hospitals、Institution "
-            "六个已选中图层的 UNITS 字段，并追加到它们在 QGIS 工程中的最近共同父组名称后。"
+            "手动启用后，汇总工程中 Sdus、Mdus、Church、Commercial、Hospitals、Institution "
+            "六个图层的 UNITS 字段，并追加到它们在 QGIS 工程中的最近共同父组名称后。"
         )
         top.addWidget(self.all_btn)
         top.addWidget(self.invert_btn)
@@ -929,7 +928,7 @@ class ExportDialog(QDialog):
         homes_group_summary = None
         if self.sum_homes_units.isChecked():
             try:
-                homes_group_summary = _homes_group_summary(selected)
+                homes_group_summary = _homes_group_summary()
             except Exception as exc:
                 QMessageBox.warning(self, "KMZ导出工具", str(exc))
                 return
