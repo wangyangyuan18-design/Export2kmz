@@ -180,25 +180,59 @@ def _field_name(layer, wanted):
     )
 
 
-def _sum_units(layer):
-    """Sum UNITS for a HOMES PASS point layer; blank/invalid values are ignored."""
-    field_name = _field_name(layer, "UNITS")
-    if not field_name:
-        return "0"
-    total = 0.0
+def _format_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("统计结果不是有限数值。")
+    if abs(number - round(number)) < 1e-9:
+        return str(int(round(number)))
+    return ("{:.10f}".format(number)).rstrip("0").rstrip(".")
+
+
+def _sum_field(layer, field_name):
+    actual = _field_name(layer, field_name) if field_name else None
+    if not actual:
+        raise ValueError("图层“{}”不存在求和字段“{}”。".format(layer.name(), field_name))
+    total, invalid = 0.0, 0
     for feature in layer.getFeatures():
-        value = feature[field_name]
+        value = feature[actual]
         if value is None or str(value).strip() == "":
             continue
         try:
             number = float(value)
             if math.isfinite(number):
                 total += number
+            else:
+                invalid += 1
         except (TypeError, ValueError):
-            continue
-    if abs(total - round(total)) < 1e-9:
-        return str(int(round(total)))
-    return ("{:.6f}".format(total)).rstrip("0").rstrip(".")
+            invalid += 1
+    if invalid:
+        raise ValueError("图层“{}”字段“{}”包含 {} 个非数值内容。".format(layer.name(), actual, invalid))
+    return _format_number(total)
+
+
+def _layer_tree_layers():
+    """Return vector layers in layer-tree order, including top-level layers."""
+    root = QgsProject.instance().layerTreeRoot()
+    result, seen = [], set()
+
+    def walk(node):
+        if hasattr(node, "layer") and callable(node.layer):
+            layer = node.layer()
+            if isinstance(layer, QgsVectorLayer) and layer.isValid() and layer.id() not in seen:
+                result.append(layer)
+                seen.add(layer.id())
+        if hasattr(node, "children"):
+            for child in node.children():
+                walk(child)
+
+    walk(root)
+    # Keep valid registry layers that are not represented in the tree.
+    for layer in QgsProject.instance().mapLayers().values():
+        if isinstance(layer, QgsVectorLayer) and layer.isValid() and layer.id() not in seen:
+            result.append(layer)
+            seen.add(layer.id())
+    return result
 
 
 def _normalize_sub_box_type(value):
@@ -337,11 +371,14 @@ class ExportDialog(QDialog):
             QComboBox { background: white; border: 1px solid #cbd5e1; border-radius: 4px; padding: 4px 6px; min-height: 22px; }
             QLabel#outputPath { background: white; border: 1px solid #cbd5e1; border-radius: 5px; padding: 8px; }
         """)
-        self.layers = [l for l in QgsProject.instance().mapLayers().values()
-                       if isinstance(l, QgsVectorLayer) and l.isValid()]
+        self.layers = _layer_tree_layers()
         self.output_path = ""
+        self._syncing = False
+        self._loading_config = True
         self.build_ui()
         self.populate()
+        self._load_project_config()
+        self._loading_config = False
 
     def build_ui(self):
         layout = QVBoxLayout(self)
@@ -376,21 +413,19 @@ class ExportDialog(QDialog):
         top.addWidget(self.import_template_btn)
         layout.addLayout(top)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels(
-            ["启用", "图层", "几何类型", "字段分组", "配置样式", "状态", "图标配置", "Description"])
+            ["启用", "图层", "几何类型", "要素数量", "字段求和", "求和字段",
+             "字段分组", "配置样式", "状态", "图标配置", "Description", "同名同步"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setWordWrap(False)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        for c in range(3, 7):
+        for c in range(12):
             header.setSectionResizeMode(c, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.Stretch)
+        header.setSectionResizeMode(10, QHeaderView.Stretch)
         header.setStretchLastSection(False)
         self.table.setMinimumHeight(260)
         self.table.verticalHeader().setDefaultSectionSize(31)
@@ -438,56 +473,231 @@ class ExportDialog(QDialog):
             geom_name.setFlags(geom_name.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(row, 2, geom_name)
 
+            count_check = QCheckBox()
+            count_check.setToolTip("勾选后，KMZ 图层文件夹名称追加要素数量")
+            count_check.setChecked(True)
+            self.table.setCellWidget(row, 3, count_check)
+
+            sum_check = QCheckBox()
+            sum_check.setToolTip("按指定数值字段求和；与要素数量互斥")
+            self.table.setCellWidget(row, 4, sum_check)
+
+            sum_field = QComboBox()
+            sum_field.addItem("(选择数值字段)", "")
+            for field in layer.fields():
+                try:
+                    numeric = field.isNumeric()
+                except Exception:
+                    numeric = field.typeName().lower() in (
+                        "integer", "integer64", "real", "double", "numeric", "decimal")
+                if numeric:
+                    sum_field.addItem(field.name(), field.name())
+            sum_field.setEnabled(False)
+            self.table.setCellWidget(row, 5, sum_field)
+
             group = QComboBox()
             group.addItem("不分组", "")
             for field in layer.fields():
                 group.addItem(field.name(), field.name())
-            self.table.setCellWidget(row, 3, group)
+            self.table.setCellWidget(row, 6, group)
 
             style = QComboBox()
             style.addItems(["默认样式", "基础样式"])
-            self.table.setCellWidget(row, 4, style)
+            self.table.setCellWidget(row, 7, style)
 
             status = QTableWidgetItem("● 未配置")
             status.setTextAlignment(Qt.AlignCenter)
             status.setForeground(QColor("#64748b"))
             status.setFlags(status.flags() & ~Qt.ItemIsEditable)
-            self.table.setItem(row, 5, status)
+            self.table.setItem(row, 8, status)
             style.currentIndexChanged.connect(
-                lambda index, r=row: self.update_status(r, index)
-            )
+                lambda index, r=row: self.update_status(r, index))
 
             icon = QComboBox()
             icon.addItems(["默认", "空心圆环", "圆点", "方形"])
             icon.setEnabled(QgsWkbTypes.geometryType(layer.wkbType()) == QgsWkbTypes.PointGeometry)
-            self.table.setCellWidget(row, 6, icon)
+            self.table.setCellWidget(row, 9, icon)
 
             desc = QComboBox()
             desc.addItem("(不添加说明)", "")
             for field in layer.fields():
                 desc.addItem(field.name(), field.name())
-            self.table.setCellWidget(row, 7, desc)
+            self.table.setCellWidget(row, 10, desc)
+
+            sync_check = QCheckBox()
+            sync_check.setToolTip("同步统计方式、求和字段和 Description 到工程中所有同名图层")
+            self.table.setCellWidget(row, 11, sync_check)
             # SUB BOX is always categorized by its Type field for ODN KMZ output.
             if layer.name().strip().casefold() == "sub box":
                 type_index = group.findData(_field_name(layer, "Type") or "")
                 if type_index >= 0:
                     group.setCurrentIndex(type_index)
+            # Preserve the old default output: HOMES PASS layers sum UNITS;
+            # all other layers append feature counts.
+            layer_key = layer.name().strip().casefold()
+            if layer_key in {"sdus", "mdus", "church", "commercial", "hospitals", "institution"}:
+                units_index = sum_field.findData(_field_name(layer, "UNITS") or "")
+                if units_index >= 0:
+                    sum_field.setCurrentIndex(units_index)
+                    count_check.setChecked(False)
+                    sum_check.setChecked(True)
+
             self.controls.append({
-                "layer": layer, "group": group, "style": style,
-                "icon": icon, "description": desc
+                "layer": layer, "count": count_check, "sum_enabled": sum_check,
+                "sum_field": sum_field, "group": group, "style": style,
+                "icon": icon, "description": desc, "sync": sync_check
             })
+            count_check.toggled.connect(
+                lambda checked, r=row: self._count_toggled(r, checked))
+            sum_check.toggled.connect(
+                lambda checked, r=row: self._sum_toggled(r, checked))
+            sum_field.currentIndexChanged.connect(lambda _i: self._sync_from_row(row))
+            desc.currentIndexChanged.connect(lambda _i, r=row: self._sync_from_row(r))
+            sync_check.toggled.connect(lambda _checked, r=row: self._sync_from_row(r))
         self.table.resizeColumnsToContents()
         # Keep the layer-name column content-sized but prevent very long names
         # from making the whole dialog unwieldy.
         self.table.setColumnWidth(1, min(max(self.table.columnWidth(1), 125), 260))
         self.table.setColumnWidth(0, 52)
         self.table.setColumnWidth(2, 84)
-        self.table.setColumnWidth(5, 78)
-        self.table.setColumnWidth(6, 135)
-        self.table.setColumnWidth(7, 150)
+        self.table.setColumnWidth(3, 70)
+        self.table.setColumnWidth(4, 70)
+        self.table.setColumnWidth(8, 78)
+        self.table.setColumnWidth(9, 110)
+        self.table.setColumnWidth(10, 150)
+        self.table.setColumnWidth(11, 85)
+
+    def _count_toggled(self, row, checked):
+        control = self.controls[row]
+        if checked:
+            control["sum_enabled"].blockSignals(True)
+            control["sum_enabled"].setChecked(False)
+            control["sum_enabled"].blockSignals(False)
+            control["sum_field"].setEnabled(False)
+        self._sync_from_row(row)
+
+    def _sum_toggled(self, row, checked):
+        control = self.controls[row]
+        if checked:
+            control["count"].blockSignals(True)
+            control["count"].setChecked(False)
+            control["count"].blockSignals(False)
+        control["sum_field"].setEnabled(checked)
+        self._sync_from_row(row)
+
+    def _sync_from_row(self, row):
+        if self._loading_config or self._syncing:
+            return
+        source = self.controls[row]
+        if not source["sync"].isChecked():
+            self._save_project_config()
+            return
+        name = source["layer"].name()
+        values = (source["count"].isChecked(), source["sum_enabled"].isChecked(),
+                  source["sum_field"].currentData() or "",
+                  source["description"].currentData() or "")
+        warnings = []
+        self._syncing = True
+        for target in self.controls:
+            if target is source or target["layer"].name() != name:
+                continue
+            layer = target["layer"]
+            for key in ("count", "sum_enabled", "sum_field", "description"):
+                target[key].blockSignals(True)
+            count_on, sum_on, sum_name, desc_name = values
+            target["count"].setChecked(count_on)
+            target["sum_enabled"].setChecked(sum_on and not count_on)
+            sum_index = target["sum_field"].findData(sum_name)
+            desc_index = target["description"].findData(desc_name)
+            if sum_on and not count_on and sum_index < 0:
+                warnings.append("{}：缺少求和字段“{}”".format(layer.name(), sum_name))
+            elif sum_index >= 0:
+                target["sum_field"].setCurrentIndex(sum_index)
+            if desc_name and desc_index < 0:
+                warnings.append("{}：缺少 Description 字段“{}”".format(layer.name(), desc_name))
+            elif desc_index >= 0:
+                target["description"].setCurrentIndex(desc_index)
+            target["sum_field"].setEnabled(sum_on and not count_on)
+            for key in ("count", "sum_enabled", "sum_field", "description"):
+                target[key].blockSignals(False)
+        self._syncing = False
+        self._save_project_config()
+        if warnings:
+            QMessageBox.warning(self, "同名图层同步提示",
+                                "以下同名图层字段不匹配，其他图层已正常同步：\n" + "\n".join(warnings))
+
+    def _config_payload(self):
+        payload = {"version": 2, "show_attributes": self.attrs.isChecked(),
+                   "output_path": self.output_path, "layers": []}
+        for row, item in enumerate(self.controls):
+            payload["layers"].append({
+                "layer_id": item["layer"].id(), "name": item["layer"].name(),
+                "enabled": self.table.item(row, 0).checkState() == Qt.Checked,
+                "count_enabled": item["count"].isChecked(),
+                "sum_enabled": item["sum_enabled"].isChecked(),
+                "sum_field": item["sum_field"].currentData() or "",
+                "group_field": item["group"].currentData() or "",
+                "style": item["style"].currentText(), "icon": item["icon"].currentText(),
+                "description_field": item["description"].currentData() or "",
+                "sync": item["sync"].isChecked()
+            })
+        return payload
+
+    def _save_project_config(self):
+        if self._loading_config:
+            return
+        try:
+            project = QgsProject.instance()
+            project.setCustomProperty("Export2KMZ/config_v2",
+                                      json.dumps(self._config_payload(), ensure_ascii=False))
+            project.setDirty(True)
+        except Exception as exc:
+            print("Export2KMZ 配置保存失败：{}".format(exc))
+
+    def _load_project_config(self):
+        raw = QgsProject.instance().customProperty("Export2KMZ/config_v2", "")
+        if not raw:
+            return
+        try:
+            config = json.loads(raw)
+            saved_by_id = {entry.get("layer_id"): entry for entry in config.get("layers", [])
+                           if entry.get("layer_id")}
+            saved_by_name = {}
+            for entry in config.get("layers", []):
+                saved_by_name.setdefault(entry.get("name"), []).append(entry)
+            name_offsets = {}
+            for row, item in enumerate(self.controls):
+                layer = item["layer"]
+                saved = saved_by_id.get(layer.id())
+                if saved is None:
+                    candidates = saved_by_name.get(layer.name(), [])
+                    offset = name_offsets.get(layer.name(), 0)
+                    if offset < len(candidates):
+                        saved = candidates[offset]
+                        name_offsets[layer.name()] = offset + 1
+                if not saved:
+                    continue
+                self.table.item(row, 0).setCheckState(
+                    Qt.Checked if saved.get("enabled", True) else Qt.Unchecked)
+                item["count"].setChecked(bool(saved.get("count_enabled", True)))
+                item["sum_enabled"].setChecked(
+                    bool(saved.get("sum_enabled", False)) and not item["count"].isChecked())
+                self._set_combo_data(item["sum_field"], saved.get("sum_field", ""))
+                self._set_combo_data(item["group"], saved.get("group_field", ""))
+                self._set_combo_text(item["style"], saved.get("style", "默认样式"))
+                self._set_combo_text(item["icon"], saved.get("icon", "默认"))
+                self._set_combo_data(item["description"], saved.get("description_field", ""))
+                item["sum_field"].setEnabled(item["sum_enabled"].isChecked())
+                item["sync"].setChecked(bool(saved.get("sync", False)))
+            self.attrs.setChecked(bool(config.get("show_attributes", True)))
+            self.output_path = config.get("output_path", "") or ""
+            self.output.setText(self.output_path if self.output_path else "请选择 KMZ 保存位置")
+            self.output.setToolTip(self.output_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "配置恢复提示", "无法完整恢复工程配置：\n{}".format(exc))
 
     def update_status(self, row, index):
-        item = self.table.item(row, 5)
+        item = self.table.item(row, 8)
         if item is None:
             return
         if index == 0:
@@ -515,6 +725,7 @@ class ExportDialog(QDialog):
             self.output_path = path
             self.output.setText(path)
             self.output.setToolTip(path)
+            self._save_project_config()
 
     def export_template(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -537,7 +748,11 @@ class ExportDialog(QDialog):
                 "group_field": item["group"].currentData() or "",
                 "style": item["style"].currentText(),
                 "icon": item["icon"].currentText(),
-                "description_field": item["description"].currentData() or ""
+                "description_field": item["description"].currentData() or "",
+                "count_enabled": item["count"].isChecked(),
+                "sum_enabled": item["sum_enabled"].isChecked(),
+                "sum_field": item["sum_field"].currentData() or "",
+                "sync": item["sync"].isChecked()
             })
         try:
             with open(path, "w", encoding="utf-8") as stream:
@@ -556,21 +771,35 @@ class ExportDialog(QDialog):
                 config = json.load(stream)
             if config.get("format") != "Export2kmzStyleTemplate":
                 raise ValueError("这不是 Export2kmz 样式模板 JSON 文件。")
-            saved_layers = {entry.get("name"): entry for entry in config.get("layers", [])}
+            saved_layers = {}
+            for entry in config.get("layers", []):
+                saved_layers.setdefault(entry.get("name"), []).append(entry)
+            name_offsets = {}
             for row, item in enumerate(self.controls):
-                saved = saved_layers.get(item["layer"].name())
-                if not saved:
+                name = item["layer"].name()
+                candidates = saved_layers.get(name, [])
+                offset = name_offsets.get(name, 0)
+                if offset >= len(candidates):
                     continue
+                saved = candidates[offset]
+                name_offsets[name] = offset + 1
                 self.table.item(row, 0).setCheckState(
                     Qt.Checked if saved.get("enabled", True) else Qt.Unchecked)
                 self._set_combo_data(item["group"], saved.get("group_field", ""))
                 self._set_combo_text(item["style"], saved.get("style", "默认样式"))
                 self._set_combo_text(item["icon"], saved.get("icon", "默认"))
                 self._set_combo_data(item["description"], saved.get("description_field", ""))
+                item["count"].setChecked(bool(saved.get("count_enabled", True)))
+                item["sum_enabled"].setChecked(
+                    bool(saved.get("sum_enabled", False)) and not item["count"].isChecked())
+                self._set_combo_data(item["sum_field"], saved.get("sum_field", ""))
+                item["sum_field"].setEnabled(item["sum_enabled"].isChecked())
+                item["sync"].setChecked(bool(saved.get("sync", False)))
             self.attrs.setChecked(bool(config.get("show_attributes", True)))
             self.output_path = config.get("output_path", "") or ""
             self.output.setText(self.output_path if self.output_path else "请选择 KMZ 保存位置")
             self.output.setToolTip(self.output_path)
+            self._save_project_config()
             QMessageBox.information(self, "样式模板", "模板配置已导入。")
         except Exception as exc:
             QMessageBox.critical(self, "导入模板失败", str(exc))
@@ -601,6 +830,19 @@ class ExportDialog(QDialog):
         if not selected:
             QMessageBox.warning(self, "KMZ导出工具", "请至少选择一个图层。")
             return
+        for item in selected:
+            if item["sum_enabled"].isChecked():
+                field_name = item["sum_field"].currentData() or ""
+                if not field_name:
+                    QMessageBox.warning(self, "KMZ导出工具",
+                        "图层“{}”已启用字段求和，但没有选择求和字段。".format(item["layer"].name()))
+                    return
+                try:
+                    _sum_field(item["layer"], field_name)
+                except Exception as exc:
+                    QMessageBox.warning(self, "KMZ导出工具", str(exc))
+                    return
+        self._save_project_config()
 
         progress = ExportProgressDialog(self)
         progress.show()
@@ -632,10 +874,6 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
     exported_count = 0
     geometry_stats = {"point": 0, "line": 0, "polygon": 0}
     folder_cache = {}
-    home_layer_names = {
-        "sdus", "mdus", "church", "commercial", "hospitals", "institution"
-    }
-
     if progress:
         progress.setValue(0)
         progress.setLabelText("正在导出图层…")
@@ -650,12 +888,13 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
         for group_name in _layer_tree_path(layer):
             parent_folder = _ensure_kml_folder(parent_folder, group_name, folder_cache)
 
-        # Every exported layer receives a total count. HOMES PASS child layers
-        # use the sum of UNITS instead of point feature count.
-        if layer_key in home_layer_names:
-            layer_folder_name = "{}={}".format(layer.name(), _sum_units(layer))
-        else:
+        if item["count"].isChecked():
             layer_folder_name = "{}={}".format(layer.name(), layer.featureCount())
+        elif item["sum_enabled"].isChecked():
+            layer_folder_name = "{}={}".format(
+                layer.name(), _sum_field(layer, item["sum_field"].currentData()))
+        else:
+            layer_folder_name = layer.name()
         layer_folder = _ensure_kml_folder(parent_folder, layer_folder_name, folder_cache)
 
         renderer = layer.renderer()
@@ -753,6 +992,13 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
             if desc_field:
                 value = feature[desc_field]
                 if value is not None:
+                    if str(desc_field).strip().casefold() == "hp count":
+                        try:
+                            number = float(value)
+                            if math.isfinite(number) and abs(number - round(number)) < 1e-9:
+                                value = str(int(round(number)))
+                        except (TypeError, ValueError):
+                            pass
                     add_text(placemark, "description", value)
             elif include_attributes:
                 extended = ET.SubElement(placemark, qn("ExtendedData"))
