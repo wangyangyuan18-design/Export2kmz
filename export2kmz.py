@@ -3,6 +3,7 @@
 import os
 import math
 import json
+from decimal import Decimal, InvalidOperation, localcontext
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
@@ -162,6 +163,83 @@ def _layer_tree_path(layer):
     return tuple(names)
 
 
+_HOMES_SUM_LAYER_NAMES = (
+    "Sdus", "Mdus", "Church", "Commercial", "Hospitals", "Institution"
+)
+
+
+def _homes_group_summary():
+    """Find the deepest existing group containing one of each HOMES layer and sum UNITS."""
+    root = QgsProject.instance().layerTreeRoot()
+    target_names = {name.casefold() for name in _HOMES_SUM_LAYER_NAMES}
+    candidates = []
+
+    def group_path(group):
+        names = []
+        parent = group
+        while parent is not None and parent.parent() is not None:
+            names.append(parent.name())
+            parent = parent.parent()
+        names.reverse()
+        return tuple(names)
+
+    def descendant_layers(group):
+        found = {name: [] for name in target_names}
+
+        def walk(node):
+            if hasattr(node, "layer") and callable(node.layer):
+                layer = node.layer()
+                if isinstance(layer, QgsVectorLayer) and layer.isValid():
+                    key = layer.name().strip().casefold()
+                    if key in found:
+                        found[key].append(layer)
+            if hasattr(node, "children"):
+                for child in node.children():
+                    walk(child)
+
+        for child in group.children():
+            walk(child)
+        return found
+
+    def inspect_groups(node):
+        # The root is not an exportable named folder; inspect named groups only.
+        if node is not root and hasattr(node, "children") and callable(node.children):
+            found = descendant_layers(node)
+            if all(len(found[name.casefold()]) == 1 for name in _HOMES_SUM_LAYER_NAMES):
+                path = group_path(node)
+                candidates.append((len(path), path, [
+                    found[name.casefold()][0] for name in _HOMES_SUM_LAYER_NAMES
+                ]))
+        if hasattr(node, "children"):
+            for child in node.children():
+                inspect_groups(child)
+
+    inspect_groups(root)
+    if not candidates:
+        raise ValueError(
+            "已勾选“汇总 UNITS 字段”，但没有找到一个现有 QGIS 组，"
+            "其中恰好包含 Sdus、Mdus、Church、Commercial、Hospitals、Institution "
+            "各一个图层。请检查六个图层是否位于同一个组内。"
+        )
+
+    deepest = max(item[0] for item in candidates)
+    best = [item for item in candidates if item[0] == deepest]
+    if len(best) != 1:
+        paths = [" / ".join(item[1]) for item in best]
+        raise ValueError(
+            "工程中找到多个同层级、均包含完整 HOMES 六图层的组，无法自动判断要汇总哪一个：{}。"
+            "请确认只保留一个目标组，或调整图层树结构。".format("；".join(paths))
+        )
+
+    _, group_path_value, layers = best[0]
+    total = Decimal("0")
+    with localcontext() as context:
+        context.prec = 50
+        for layer in layers:
+            total += Decimal(_sum_field(layer, "UNITS"))
+    return tuple(group_path_value), _format_number(total)
+
+
 def _ensure_kml_folder(parent, name, cache):
     """Reuse a Folder with the same name under the same parent."""
     key = (id(parent), str(name))
@@ -181,31 +259,36 @@ def _field_name(layer, wanted):
 
 
 def _format_number(value):
-    number = float(value)
-    if not math.isfinite(number):
+    """Format a Decimal without adding .0 or losing meaningful precision."""
+    number = value if isinstance(value, Decimal) else Decimal(str(value))
+    if not number.is_finite():
         raise ValueError("统计结果不是有限数值。")
-    if abs(number - round(number)) < 1e-9:
-        return str(int(round(number)))
-    return ("{:.10f}".format(number)).rstrip("0").rstrip(".")
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def _sum_field(layer, field_name):
+    """Sum a numeric field exactly; ignore nulls and reject non-numeric values."""
     actual = _field_name(layer, field_name) if field_name else None
     if not actual:
         raise ValueError("图层“{}”不存在求和字段“{}”。".format(layer.name(), field_name))
-    total, invalid = 0.0, 0
-    for feature in layer.getFeatures():
-        value = feature[actual]
-        if value is None or str(value).strip() == "":
-            continue
-        try:
-            number = float(value)
-            if math.isfinite(number):
-                total += number
-            else:
+    total, invalid = Decimal("0"), 0
+    with localcontext() as context:
+        context.prec = 50
+        for feature in layer.getFeatures():
+            value = feature[actual]
+            if value is None or str(value).strip() == "":
+                continue
+            try:
+                number = Decimal(str(value).strip())
+                if number.is_finite():
+                    total += number
+                else:
+                    invalid += 1
+            except (InvalidOperation, TypeError, ValueError):
                 invalid += 1
-        except (TypeError, ValueError):
-            invalid += 1
     if invalid:
         raise ValueError("图层“{}”字段“{}”包含 {} 个非数值内容。".format(layer.name(), actual, invalid))
     return _format_number(total)
@@ -402,10 +485,17 @@ class ExportDialog(QDialog):
         self.invert_btn = QPushButton("✕ 反选")
         self.attrs = QCheckBox("显示属性信息")
         self.attrs.setChecked(True)
+        self.sum_homes_units = QCheckBox("汇总 UNITS 字段")
+        self.sum_homes_units.setChecked(False)
+        self.sum_homes_units.setToolTip(
+            "手动启用后，汇总工程中 Sdus、Mdus、Church、Commercial、Hospitals、Institution "
+            "六个图层的 UNITS 字段，并追加到它们在 QGIS 工程中的最近共同父组名称后。"
+        )
         top.addWidget(self.all_btn)
         top.addWidget(self.invert_btn)
         top.addStretch(1)
         top.addWidget(self.attrs)
+        top.addWidget(self.sum_homes_units)
         top.addStretch(1)
         self.export_template_btn = QPushButton("导出样式模板")
         self.import_template_btn = QPushButton("导入样式模板")
@@ -447,6 +537,9 @@ class ExportDialog(QDialog):
         bottom.addWidget(self.cancel_btn)
         layout.addLayout(bottom)
 
+        self.table.itemChanged.connect(self._on_table_item_changed)
+        self.attrs.toggled.connect(self._save_project_config)
+        self.sum_homes_units.toggled.connect(self._save_project_config)
         self.all_btn.clicked.connect(lambda: self.set_checks(True))
         self.invert_btn.clicked.connect(self.invert_checks)
         self.browse_btn.clicked.connect(self.browse)
@@ -512,11 +605,14 @@ class ExportDialog(QDialog):
             self.table.setItem(row, 8, status)
             style.currentIndexChanged.connect(
                 lambda index, r=row: self.update_status(r, index))
+            style.currentIndexChanged.connect(self._save_project_config)
+            group.currentIndexChanged.connect(self._save_project_config)
 
             icon = QComboBox()
             icon.addItems(["默认", "空心圆环", "圆点", "方形"])
             icon.setEnabled(QgsWkbTypes.geometryType(layer.wkbType()) == QgsWkbTypes.PointGeometry)
             self.table.setCellWidget(row, 9, icon)
+            icon.currentIndexChanged.connect(self._save_project_config)
 
             desc = QComboBox()
             desc.addItem("(不添加说明)", "")
@@ -532,16 +628,6 @@ class ExportDialog(QDialog):
                 type_index = group.findData(_field_name(layer, "Type") or "")
                 if type_index >= 0:
                     group.setCurrentIndex(type_index)
-            # Preserve the old default output: HOMES PASS layers sum UNITS;
-            # all other layers append feature counts.
-            layer_key = layer.name().strip().casefold()
-            if layer_key in {"sdus", "mdus", "church", "commercial", "hospitals", "institution"}:
-                units_index = sum_field.findData(_field_name(layer, "UNITS") or "")
-                if units_index >= 0:
-                    sum_field.setCurrentIndex(units_index)
-                    count_check.setChecked(False)
-                    sum_check.setChecked(True)
-
             self.controls.append({
                 "layer": layer, "count": count_check, "sum_enabled": sum_check,
                 "sum_field": sum_field, "group": group, "style": style,
@@ -551,7 +637,7 @@ class ExportDialog(QDialog):
                 lambda checked, r=row: self._count_toggled(r, checked))
             sum_check.toggled.connect(
                 lambda checked, r=row: self._sum_toggled(r, checked))
-            sum_field.currentIndexChanged.connect(lambda _i: self._sync_from_row(row))
+            sum_field.currentIndexChanged.connect(lambda _i, r=row: self._sync_from_row(r))
             desc.currentIndexChanged.connect(lambda _i, r=row: self._sync_from_row(r))
             sync_check.toggled.connect(lambda _checked, r=row: self._sync_from_row(r))
         self.table.resizeColumnsToContents()
@@ -566,6 +652,10 @@ class ExportDialog(QDialog):
         self.table.setColumnWidth(9, 110)
         self.table.setColumnWidth(10, 150)
         self.table.setColumnWidth(11, 85)
+
+    def _on_table_item_changed(self, item):
+        if item is not None and item.column() == 0:
+            self._save_project_config()
 
     def _count_toggled(self, row, checked):
         control = self.controls[row]
@@ -592,42 +682,58 @@ class ExportDialog(QDialog):
         if not source["sync"].isChecked():
             self._save_project_config()
             return
+
         name = source["layer"].name()
-        values = (source["count"].isChecked(), source["sum_enabled"].isChecked(),
-                  source["sum_field"].currentData() or "",
-                  source["description"].currentData() or "")
+        count_on = source["count"].isChecked()
+        sum_on = source["sum_enabled"].isChecked()
+        sum_name = source["sum_field"].currentData() or ""
+        desc_name = source["description"].currentData() or ""
         warnings = []
         self._syncing = True
+
         for target in self.controls:
             if target is source or target["layer"].name() != name:
                 continue
+
             layer = target["layer"]
-            for key in ("count", "sum_enabled", "sum_field", "description"):
-                target[key].blockSignals(True)
-            count_on, sum_on, sum_name, desc_name = values
-            target["count"].setChecked(count_on)
-            target["sum_enabled"].setChecked(sum_on and not count_on)
             sum_index = target["sum_field"].findData(sum_name)
             desc_index = target["description"].findData(desc_name)
+
+            # Validate the entire target before changing it. A field mismatch
+            # must not leave a half-synchronized or stale configuration behind.
+            missing = []
             if sum_on and not count_on and sum_index < 0:
-                warnings.append("{}：缺少求和字段“{}”".format(layer.name(), sum_name))
-            elif sum_index >= 0:
-                target["sum_field"].setCurrentIndex(sum_index)
+                missing.append("求和字段“{}”".format(sum_name or "(未选择)"))
             if desc_name and desc_index < 0:
-                warnings.append("{}：缺少 Description 字段“{}”".format(layer.name(), desc_name))
-            elif desc_index >= 0:
+                missing.append("Description 字段“{}”".format(desc_name))
+            if missing:
+                warnings.append("{}（{}）".format(layer.name(), "、".join(missing)))
+                continue
+
+            for key in ("count", "sum_enabled", "sum_field", "description"):
+                target[key].blockSignals(True)
+            target["count"].setChecked(count_on)
+            target["sum_enabled"].setChecked(sum_on and not count_on)
+            if sum_index >= 0:
+                target["sum_field"].setCurrentIndex(sum_index)
+            if desc_index >= 0:
                 target["description"].setCurrentIndex(desc_index)
             target["sum_field"].setEnabled(sum_on and not count_on)
             for key in ("count", "sum_enabled", "sum_field", "description"):
                 target[key].blockSignals(False)
+
         self._syncing = False
         self._save_project_config()
         if warnings:
-            QMessageBox.warning(self, "同名图层同步提示",
-                                "以下同名图层字段不匹配，其他图层已正常同步：\n" + "\n".join(warnings))
+            QMessageBox.warning(
+                self, "同名图层同步提示",
+                "以下同名图层因字段不匹配而未修改；其他兼容图层已正常同步：\n"
+                + "\n".join(warnings)
+            )
 
     def _config_payload(self):
         payload = {"version": 2, "show_attributes": self.attrs.isChecked(),
+                   "sum_homes_units": self.sum_homes_units.isChecked(),
                    "output_path": self.output_path, "layers": []}
         for row, item in enumerate(self.controls):
             payload["layers"].append({
@@ -648,15 +754,17 @@ class ExportDialog(QDialog):
             return
         try:
             project = QgsProject.instance()
-            project.setCustomProperty("Export2KMZ/config_v2",
-                                      json.dumps(self._config_payload(), ensure_ascii=False))
+            project.writeEntry(
+                "Export2KMZ", "/config_v2",
+                json.dumps(self._config_payload(), ensure_ascii=False)
+            )
             project.setDirty(True)
         except Exception as exc:
             print("Export2KMZ 配置保存失败：{}".format(exc))
 
     def _load_project_config(self):
-        raw = QgsProject.instance().customProperty("Export2KMZ/config_v2", "")
-        if not raw:
+        raw, ok = QgsProject.instance().readEntry("Export2KMZ", "/config_v2", "")
+        if not ok or not raw:
             return
         try:
             config = json.loads(raw)
@@ -690,6 +798,7 @@ class ExportDialog(QDialog):
                 item["sum_field"].setEnabled(item["sum_enabled"].isChecked())
                 item["sync"].setChecked(bool(saved.get("sync", False)))
             self.attrs.setChecked(bool(config.get("show_attributes", True)))
+            self.sum_homes_units.setChecked(bool(config.get("sum_homes_units", False)))
             self.output_path = config.get("output_path", "") or ""
             self.output.setText(self.output_path if self.output_path else "请选择 KMZ 保存位置")
             self.output.setToolTip(self.output_path)
@@ -738,6 +847,7 @@ class ExportDialog(QDialog):
             "format": "Export2kmzStyleTemplate",
             "version": 1,
             "show_attributes": self.attrs.isChecked(),
+            "sum_homes_units": self.sum_homes_units.isChecked(),
             "output_path": self.output_path,
             "layers": []
         }
@@ -796,6 +906,7 @@ class ExportDialog(QDialog):
                 item["sum_field"].setEnabled(item["sum_enabled"].isChecked())
                 item["sync"].setChecked(bool(saved.get("sync", False)))
             self.attrs.setChecked(bool(config.get("show_attributes", True)))
+            self.sum_homes_units.setChecked(bool(config.get("sum_homes_units", False)))
             self.output_path = config.get("output_path", "") or ""
             self.output.setText(self.output_path if self.output_path else "请选择 KMZ 保存位置")
             self.output.setToolTip(self.output_path)
@@ -842,13 +953,23 @@ class ExportDialog(QDialog):
                 except Exception as exc:
                     QMessageBox.warning(self, "KMZ导出工具", str(exc))
                     return
+        homes_group_summary = None
+        if self.sum_homes_units.isChecked():
+            try:
+                homes_group_summary = _homes_group_summary()
+            except Exception as exc:
+                QMessageBox.warning(self, "KMZ导出工具", str(exc))
+                return
         self._save_project_config()
 
         progress = ExportProgressDialog(self)
         progress.show()
         QApplication.processEvents()
         try:
-            count, geometry_stats = export_kmz(path, selected, self.attrs.isChecked(), progress)
+            count, geometry_stats = export_kmz(
+                path, selected, self.attrs.isChecked(), progress,
+                homes_group_summary=homes_group_summary
+            )
             progress.setValue(100)
             progress.setLabelText("KMZ 文件已生成。")
             QApplication.processEvents()
@@ -863,7 +984,8 @@ class ExportDialog(QDialog):
             progress.close()
             QMessageBox.critical(self, "导出失败", str(exc))
 
-def export_kmz(output_path, selected, include_attributes=True, progress=None):
+def export_kmz(output_path, selected, include_attributes=True, progress=None,
+               homes_group_summary=None):
     doc = ET.Element(qn("kml"))
     document = ET.SubElement(doc, qn("Document"))
     add_text(document, "name", os.path.basename(output_path))
@@ -874,6 +996,9 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
     exported_count = 0
     geometry_stats = {"point": 0, "line": 0, "polygon": 0}
     folder_cache = {}
+    homes_group_path, homes_units_total = (
+        homes_group_summary if homes_group_summary is not None else ((), None)
+    )
     if progress:
         progress.setValue(0)
         progress.setLabelText("正在导出图层…")
@@ -885,7 +1010,11 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
 
         # Recreate the QGIS layer-tree hierarchy (e.g. HUB group / HOMES PASS).
         parent_folder = document
-        for group_name in _layer_tree_path(layer):
+        layer_group_path = _layer_tree_path(layer)
+        for group_index, group_name in enumerate(layer_group_path):
+            current_path = tuple(layer_group_path[:group_index + 1])
+            if homes_units_total is not None and current_path == homes_group_path:
+                group_name = "{}={}".format(group_name, homes_units_total)
             parent_folder = _ensure_kml_folder(parent_folder, group_name, folder_cache)
 
         if item["count"].isChecked():
@@ -930,6 +1059,15 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
         desc_field = item["description"].currentData() or ""
 
         type_counts = _sub_box_type_counts(layer) if is_sub_box else {}
+        group_counts = dict(type_counts)
+        if group_field and not is_sub_box:
+            for category_feature in layer.getFeatures():
+                raw_value = category_feature[group_field]
+                category_name = (
+                    "(空值)" if raw_value is None or str(raw_value).strip() == ""
+                    else str(raw_value)
+                )
+                group_counts[category_name] = group_counts.get(category_name, 0) + 1
         group_folders = {}
 
         # Create Type folders first, including renderer categories with zero
@@ -976,8 +1114,9 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
                 else:
                     group_name = "(空值)" if raw_group is None or str(raw_group).strip() == "" else str(raw_group)
                     if group_name not in group_folders:
+                        category_count = group_counts.get(group_name, 0)
                         group_folders[group_name] = _ensure_kml_folder(
-                            layer_folder, group_name, {}
+                            layer_folder, "{}={}".format(group_name, category_count), {}
                         )
                 feature_parent = group_folders[group_name]
 

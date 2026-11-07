@@ -1,11 +1,11 @@
 [general]
 name=Export2KMZ
 qgisMinimumVersion=3.16
-description=Export QGIS layer-tree groups to KMZ with ODN feature counts and HOMES PASS UNITS totals.
-version=1.1.0
+description=Export QGIS layer-tree groups to KMZ with configurable per-layer feature counts, category counts, numeric field sums, and optional group-level UNITS aggregation.
+version=1.2.2
 author=Export2KMZ contributors
 email=
-about=Exports selected QGIS vector layers to Google Earth KMZ while preserving QGIS group hierarchy. Adds feature counts to layer folders, Type counts to SUB BOX categories, and UNITS sums to HOMES PASS layers.
+about=Exports selected QGIS vector layers to Google Earth KMZ with configurable per-layer statistics, same-name synchronization, project-persisted settings, SUB BOX Type categories, category counts, and optional HOMES group UNITS summary.
 category=Vector
 icon=icon.svg
 experimental=False
