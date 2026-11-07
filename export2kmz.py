@@ -147,6 +147,93 @@ def geometry_to_kml(geometry, transform):
     return None
 
 
+
+def _layer_tree_path(layer):
+    """Return the current QGIS layer-tree group path for this layer."""
+    node = QgsProject.instance().layerTreeRoot().findLayer(layer.id())
+    if node is None:
+        return ()
+    names = []
+    parent = node.parent()
+    while parent is not None and parent.parent() is not None:
+        names.append(parent.name())
+        parent = parent.parent()
+    names.reverse()
+    return tuple(names)
+
+
+def _ensure_kml_folder(parent, name, cache):
+    """Reuse a Folder with the same name under the same parent."""
+    key = (id(parent), str(name))
+    if key not in cache:
+        folder = ET.SubElement(parent, qn("Folder"))
+        add_text(folder, "name", name)
+        cache[key] = folder
+    return cache[key]
+
+
+def _field_name(layer, wanted):
+    return next(
+        (field.name() for field in layer.fields()
+         if field.name().casefold() == wanted.casefold()),
+        None
+    )
+
+
+def _sum_units(layer):
+    """Sum UNITS for a HOMES PASS point layer; blank/invalid values are ignored."""
+    field_name = _field_name(layer, "UNITS")
+    if not field_name:
+        return "0"
+    total = 0.0
+    for feature in layer.getFeatures():
+        value = feature[field_name]
+        if value is None or str(value).strip() == "":
+            continue
+        try:
+            number = float(value)
+            if math.isfinite(number):
+                total += number
+        except (TypeError, ValueError):
+            continue
+    if abs(total - round(total)) < 1e-9:
+        return str(int(round(total)))
+    return ("{:.6f}".format(total)).rstrip("0").rstrip(".")
+
+
+def _normalize_sub_box_type(value):
+    """Format Type values consistently with the requested KMZ folder labels."""
+    label = "(空值)" if value is None or str(value).strip() == "" else str(value).strip()
+    label = " ".join(label.split())
+    label = label.replace("SUB BOX (", "SUB BOX(")
+    if label in ("70/30", "50/50"):
+        return "SUB BOX(" + label + ")"
+    return label
+
+
+def _sub_box_type_counts(layer):
+    """Count SUB BOX features by the Type field, including null values."""
+    type_field = _field_name(layer, "Type")
+    counts = {}
+    if not type_field:
+        return counts
+    for feature in layer.getFeatures():
+        label = _normalize_sub_box_type(feature[type_field])
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _sub_box_renderer_types(layer):
+    """Return categorized-renderer values so zero-count categories are retained."""
+    renderer = layer.renderer()
+    if renderer and hasattr(renderer, "categories"):
+        values = []
+        for category in renderer.categories():
+            values.append(_normalize_sub_box_type(category.value()))
+        return values
+    return []
+
+
 class ExportProgressDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -380,6 +467,11 @@ class ExportDialog(QDialog):
             for field in layer.fields():
                 desc.addItem(field.name(), field.name())
             self.table.setCellWidget(row, 7, desc)
+            # SUB BOX is always categorized by its Type field for ODN KMZ output.
+            if layer.name().strip().casefold() == "sub box":
+                type_index = group.findData(_field_name(layer, "Type") or "")
+                if type_index >= 0:
+                    group.setCurrentIndex(type_index)
             self.controls.append({
                 "layer": layer, "group": group, "style": style,
                 "icon": icon, "description": desc
@@ -534,10 +626,16 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
     document = ET.SubElement(doc, qn("Document"))
     add_text(document, "name", os.path.basename(output_path))
     target_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+
     total_features = sum(item["layer"].featureCount() for item in selected)
     processed = 0
     exported_count = 0
     geometry_stats = {"point": 0, "line": 0, "polygon": 0}
+    folder_cache = {}
+    home_layer_names = {
+        "sdus", "mdus", "church", "commercial", "hospitals", "institution"
+    }
+
     if progress:
         progress.setValue(0)
         progress.setLabelText("正在导出图层…")
@@ -545,13 +643,27 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
 
     for item in selected:
         layer = item["layer"]
-        layer_folder = ET.SubElement(document, qn("Folder"))
-        add_text(layer_folder, "name", layer.name())
+        layer_key = layer.name().strip().casefold()
+
+        # Recreate the QGIS layer-tree hierarchy (e.g. HUB group / HOMES PASS).
+        parent_folder = document
+        for group_name in _layer_tree_path(layer):
+            parent_folder = _ensure_kml_folder(parent_folder, group_name, folder_cache)
+
+        # Every exported layer receives a total count. HOMES PASS child layers
+        # use the sum of UNITS instead of point feature count.
+        if layer_key in home_layer_names:
+            layer_folder_name = "{}={}".format(layer.name(), _sum_units(layer))
+        else:
+            layer_folder_name = "{}={}".format(layer.name(), layer.featureCount())
+        layer_folder = _ensure_kml_folder(parent_folder, layer_folder_name, folder_cache)
+
         renderer = layer.renderer()
         symbol = renderer.symbol() if renderer and hasattr(renderer, "symbol") else None
         color = symbol.color() if symbol else QColor("#3388ff")
         style_id = "style_" + str(abs(hash(layer.id())))
         style = ET.SubElement(document, qn("Style"), {"id": style_id})
+
         geom_type = QgsWkbTypes.geometryType(layer.wkbType())
         if geom_type == QgsWkbTypes.PointGeometry:
             icon_style = ET.SubElement(style, qn("IconStyle"))
@@ -572,32 +684,72 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
             add_text(line, "width", "1.5")
 
         transform = QgsCoordinateTransform(layer.crs(), target_crs, QgsProject.instance())
-        group_field = item["group"].currentData() or ""
+        is_sub_box = layer_key == "sub box"
+        group_field = _field_name(layer, "Type") if is_sub_box else (item["group"].currentData() or "")
+        if group_field and _field_name(layer, group_field) is None:
+            group_field = ""
         desc_field = item["description"].currentData() or ""
+
+        type_counts = _sub_box_type_counts(layer) if is_sub_box else {}
         group_folders = {}
+
+        # Create Type folders first, including renderer categories with zero
+        # features, so empty categories are not lost in the exported KMZ.
+        if is_sub_box and group_field:
+            type_labels = list(_sub_box_renderer_types(layer))
+            for label in type_counts:
+                if label not in type_labels:
+                    type_labels.append(label)
+            for label in type_labels:
+                count = type_counts.get(label, 0)
+                folder_name = "{}={}".format(label, count)
+                group_folders[label] = _ensure_kml_folder(layer_folder, folder_name, {})
+
         for feature in layer.getFeatures():
             if progress and progress.wasCanceled():
                 raise InterruptedError("用户取消了导出。")
+
             geom = feature.geometry()
             if geom is None or geom.isEmpty():
+                processed += 1
+                if progress:
+                    value = int(processed * 95 / max(total_features, 1))
+                    progress.setValue(value)
+                    progress.setLabelText(
+                        "正在导出：{}  |  已处理 {} / {} 个要素".format(
+                            layer.name(), processed, total_features
+                        )
+                    )
+                    QApplication.processEvents()
                 continue
-            parent_folder = layer_folder
+
+            feature_parent = layer_folder
             if group_field:
                 raw_group = feature[group_field]
-                group_name = "(空值)" if raw_group is None or str(raw_group).strip() == "" else str(raw_group)
-                if group_name not in group_folders:
-                    subfolder = ET.SubElement(layer_folder, qn("Folder"))
-                    add_text(subfolder, "name", group_name)
-                    group_folders[group_name] = subfolder
-                parent_folder = group_folders[group_name]
+                if is_sub_box:
+                    group_name = _normalize_sub_box_type(raw_group)
+                    folder_label = group_name
+                    if group_name not in group_folders:
+                        count = type_counts.get(group_name, 0)
+                        group_folders[group_name] = _ensure_kml_folder(
+                            layer_folder, "{}={}".format(folder_label, count), {}
+                        )
+                else:
+                    group_name = "(空值)" if raw_group is None or str(raw_group).strip() == "" else str(raw_group)
+                    if group_name not in group_folders:
+                        group_folders[group_name] = _ensure_kml_folder(
+                            layer_folder, group_name, {}
+                        )
+                feature_parent = group_folders[group_name]
 
-            placemark = ET.SubElement(parent_folder, qn("Placemark"))
-            name_idx = layer.fields().indexFromName("name")
+            placemark = ET.SubElement(feature_parent, qn("Placemark"))
+            name_idx = layer.fields().indexFromName("Name")
             if name_idx < 0:
-                name_idx = layer.fields().indexFromName("Name")
+                name_idx = layer.fields().indexFromName("name")
             name_value = feature[name_idx] if name_idx >= 0 else feature.id()
             add_text(placemark, "name", name_value)
             add_text(placemark, "styleUrl", "#" + style_id)
+
             if desc_field:
                 value = feature[desc_field]
                 if value is not None:
@@ -608,11 +760,11 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
                     data = ET.SubElement(extended, qn("Data"), {"name": field.name()})
                     value = feature[field.name()]
                     add_text(data, "value", "" if value is None else value)
+
             geometry_node = geometry_to_kml(geom, transform)
             if geometry_node is not None:
                 placemark.append(geometry_node)
                 exported_count += 1
-                geom_type = QgsWkbTypes.geometryType(layer.wkbType())
                 if geom_type == QgsWkbTypes.PointGeometry:
                     geometry_stats["point"] += 1
                 elif geom_type == QgsWkbTypes.LineGeometry:
@@ -638,15 +790,20 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
 
     if progress and progress.wasCanceled():
         raise InterruptedError("用户取消了导出。")
+
     xml = ET.tostring(doc, encoding="utf-8", xml_declaration=True)
     output_path = os.path.abspath(output_path)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.isdir(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
     with tempfile.TemporaryDirectory() as tmp:
         kml_path = os.path.join(tmp, "doc.kml")
         with open(kml_path, "wb") as stream:
             stream.write(xml)
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(kml_path, "doc.kml")
+
     return exported_count, geometry_stats
 
 
