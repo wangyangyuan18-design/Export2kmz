@@ -3,6 +3,7 @@
 import os
 import math
 import json
+from decimal import Decimal, InvalidOperation
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
@@ -181,30 +182,33 @@ def _field_name(layer, wanted):
 
 
 def _format_number(value):
-    number = float(value)
-    if not math.isfinite(number):
+    """Format a Decimal without adding .0 or losing meaningful precision."""
+    number = value if isinstance(value, Decimal) else Decimal(str(value))
+    if not number.is_finite():
         raise ValueError("统计结果不是有限数值。")
-    if abs(number - round(number)) < 1e-9:
-        return str(int(round(number)))
-    return ("{:.10f}".format(number)).rstrip("0").rstrip(".")
+    normalized = number.normalize()
+    if normalized == normalized.to_integral_value():
+        return format(normalized.quantize(Decimal("1")), "f")
+    return format(normalized, "f")
 
 
 def _sum_field(layer, field_name):
+    """Sum a numeric field exactly; ignore nulls and reject non-numeric values."""
     actual = _field_name(layer, field_name) if field_name else None
     if not actual:
         raise ValueError("图层“{}”不存在求和字段“{}”。".format(layer.name(), field_name))
-    total, invalid = 0.0, 0
+    total, invalid = Decimal("0"), 0
     for feature in layer.getFeatures():
         value = feature[actual]
         if value is None or str(value).strip() == "":
             continue
         try:
-            number = float(value)
-            if math.isfinite(number):
+            number = Decimal(str(value).strip())
+            if number.is_finite():
                 total += number
             else:
                 invalid += 1
-        except (TypeError, ValueError):
+        except (InvalidOperation, TypeError, ValueError):
             invalid += 1
     if invalid:
         raise ValueError("图层“{}”字段“{}”包含 {} 个非数值内容。".format(layer.name(), actual, invalid))
@@ -447,6 +451,8 @@ class ExportDialog(QDialog):
         bottom.addWidget(self.cancel_btn)
         layout.addLayout(bottom)
 
+        self.table.itemChanged.connect(self._on_table_item_changed)
+        self.attrs.toggled.connect(self._save_project_config)
         self.all_btn.clicked.connect(lambda: self.set_checks(True))
         self.invert_btn.clicked.connect(self.invert_checks)
         self.browse_btn.clicked.connect(self.browse)
@@ -512,6 +518,9 @@ class ExportDialog(QDialog):
             self.table.setItem(row, 8, status)
             style.currentIndexChanged.connect(
                 lambda index, r=row: self.update_status(r, index))
+            style.currentIndexChanged.connect(self._save_project_config)
+            group.currentIndexChanged.connect(self._save_project_config)
+            icon.currentIndexChanged.connect(self._save_project_config)
 
             icon = QComboBox()
             icon.addItems(["默认", "空心圆环", "圆点", "方形"])
@@ -532,16 +541,6 @@ class ExportDialog(QDialog):
                 type_index = group.findData(_field_name(layer, "Type") or "")
                 if type_index >= 0:
                     group.setCurrentIndex(type_index)
-            # Preserve the old default output: HOMES PASS layers sum UNITS;
-            # all other layers append feature counts.
-            layer_key = layer.name().strip().casefold()
-            if layer_key in {"sdus", "mdus", "church", "commercial", "hospitals", "institution"}:
-                units_index = sum_field.findData(_field_name(layer, "UNITS") or "")
-                if units_index >= 0:
-                    sum_field.setCurrentIndex(units_index)
-                    count_check.setChecked(False)
-                    sum_check.setChecked(True)
-
             self.controls.append({
                 "layer": layer, "count": count_check, "sum_enabled": sum_check,
                 "sum_field": sum_field, "group": group, "style": style,
@@ -551,7 +550,7 @@ class ExportDialog(QDialog):
                 lambda checked, r=row: self._count_toggled(r, checked))
             sum_check.toggled.connect(
                 lambda checked, r=row: self._sum_toggled(r, checked))
-            sum_field.currentIndexChanged.connect(lambda _i: self._sync_from_row(row))
+            sum_field.currentIndexChanged.connect(lambda _i, r=row: self._sync_from_row(r))
             desc.currentIndexChanged.connect(lambda _i, r=row: self._sync_from_row(r))
             sync_check.toggled.connect(lambda _checked, r=row: self._sync_from_row(r))
         self.table.resizeColumnsToContents()
@@ -566,6 +565,10 @@ class ExportDialog(QDialog):
         self.table.setColumnWidth(9, 110)
         self.table.setColumnWidth(10, 150)
         self.table.setColumnWidth(11, 85)
+
+    def _on_table_item_changed(self, item):
+        if item is not None and item.column() == 0:
+            self._save_project_config()
 
     def _count_toggled(self, row, checked):
         control = self.controls[row]
@@ -592,39 +595,54 @@ class ExportDialog(QDialog):
         if not source["sync"].isChecked():
             self._save_project_config()
             return
+
         name = source["layer"].name()
-        values = (source["count"].isChecked(), source["sum_enabled"].isChecked(),
-                  source["sum_field"].currentData() or "",
-                  source["description"].currentData() or "")
+        count_on = source["count"].isChecked()
+        sum_on = source["sum_enabled"].isChecked()
+        sum_name = source["sum_field"].currentData() or ""
+        desc_name = source["description"].currentData() or ""
         warnings = []
         self._syncing = True
+
         for target in self.controls:
             if target is source or target["layer"].name() != name:
                 continue
+
             layer = target["layer"]
-            for key in ("count", "sum_enabled", "sum_field", "description"):
-                target[key].blockSignals(True)
-            count_on, sum_on, sum_name, desc_name = values
-            target["count"].setChecked(count_on)
-            target["sum_enabled"].setChecked(sum_on and not count_on)
             sum_index = target["sum_field"].findData(sum_name)
             desc_index = target["description"].findData(desc_name)
+
+            # Validate the entire target before changing it. A field mismatch
+            # must not leave a half-synchronized or stale configuration behind.
+            missing = []
             if sum_on and not count_on and sum_index < 0:
-                warnings.append("{}：缺少求和字段“{}”".format(layer.name(), sum_name))
-            elif sum_index >= 0:
-                target["sum_field"].setCurrentIndex(sum_index)
+                missing.append("求和字段“{}”".format(sum_name or "(未选择)"))
             if desc_name and desc_index < 0:
-                warnings.append("{}：缺少 Description 字段“{}”".format(layer.name(), desc_name))
-            elif desc_index >= 0:
+                missing.append("Description 字段“{}”".format(desc_name))
+            if missing:
+                warnings.append("{}（{}）".format(layer.name(), "、".join(missing)))
+                continue
+
+            for key in ("count", "sum_enabled", "sum_field", "description"):
+                target[key].blockSignals(True)
+            target["count"].setChecked(count_on)
+            target["sum_enabled"].setChecked(sum_on and not count_on)
+            if sum_index >= 0:
+                target["sum_field"].setCurrentIndex(sum_index)
+            if desc_index >= 0:
                 target["description"].setCurrentIndex(desc_index)
             target["sum_field"].setEnabled(sum_on and not count_on)
             for key in ("count", "sum_enabled", "sum_field", "description"):
                 target[key].blockSignals(False)
+
         self._syncing = False
         self._save_project_config()
         if warnings:
-            QMessageBox.warning(self, "同名图层同步提示",
-                                "以下同名图层字段不匹配，其他图层已正常同步：\n" + "\n".join(warnings))
+            QMessageBox.warning(
+                self, "同名图层同步提示",
+                "以下同名图层因字段不匹配而未修改；其他兼容图层已正常同步：\n"
+                + "\n".join(warnings)
+            )
 
     def _config_payload(self):
         payload = {"version": 2, "show_attributes": self.attrs.isChecked(),
