@@ -668,15 +668,17 @@ class ExportDialog(QDialog):
             return
         try:
             project = QgsProject.instance()
-            project.setCustomProperty("Export2KMZ/config_v2",
-                                      json.dumps(self._config_payload(), ensure_ascii=False))
+            project.writeEntry(
+                "Export2KMZ", "/config_v2",
+                json.dumps(self._config_payload(), ensure_ascii=False)
+            )
             project.setDirty(True)
         except Exception as exc:
             print("Export2KMZ 配置保存失败：{}".format(exc))
 
     def _load_project_config(self):
-        raw = QgsProject.instance().customProperty("Export2KMZ/config_v2", "")
-        if not raw:
+        raw, ok = QgsProject.instance().readEntry("Export2KMZ", "/config_v2", "")
+        if not ok or not raw:
             return
         try:
             config = json.loads(raw)
