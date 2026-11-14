@@ -612,6 +612,12 @@ class ExportDialog(QDialog):
         values = (source["count"].isChecked(), source["sum_enabled"].isChecked(),
                   source["sum_field"].currentData() or "",
                   source["description"].currentData() or "")
+        if values[0] and values[1]:
+            QMessageBox.warning(
+                self, "同名图层同步提示",
+                "图层“{}”同时启用了两种统计方式，请先修正勾选状态。".format(name)
+            )
+            return
         warnings = []
         self._syncing = True
         for target in self.controls:
@@ -622,7 +628,7 @@ class ExportDialog(QDialog):
                 target[key].blockSignals(True)
             count_on, sum_on, sum_name, desc_name = values
             target["count"].setChecked(count_on)
-            target["sum_enabled"].setChecked(sum_on and not count_on)
+            target["sum_enabled"].setChecked(sum_on)
             sum_index = target["sum_field"].findData(sum_name)
             desc_index = target["description"].findData(desc_name)
             if sum_on and not count_on and sum_index < 0:
@@ -633,7 +639,7 @@ class ExportDialog(QDialog):
                 warnings.append("{}：缺少 Description 字段“{}”".format(layer.name(), desc_name))
             elif desc_index >= 0:
                 target["description"].setCurrentIndex(desc_index)
-            target["sum_field"].setEnabled(sum_on and not count_on)
+            target["sum_field"].setEnabled(sum_on)
             for key in ("count", "sum_enabled", "sum_field", "description"):
                 target[key].blockSignals(False)
         self._syncing = False
