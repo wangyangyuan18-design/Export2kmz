@@ -18,7 +18,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsWkbTypes, QgsCoordinateReferenceSystem,
-    QgsCoordinateTransform, QgsGeometry
+    QgsCoordinateTransform, QgsGeometry, QgsDistanceArea
 )
 
 KML_NS = "http://www.opengis.net/kml/2.2"
@@ -1139,12 +1139,35 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None,
                         except (TypeError, ValueError):
                             pass
                     add_text(placemark, "description", value)
-            elif include_attributes:
+
+            # Keep the selected Description behavior unchanged. For ordinary
+            # attribute export, retain all source fields; Distribution Cable
+            # additionally always receives a measured length field.
+            extended = None
+            if include_attributes and not desc_field:
                 extended = ET.SubElement(placemark, qn("ExtendedData"))
                 for field in layer.fields():
                     data = ET.SubElement(extended, qn("Data"), {"name": field.name()})
                     value = feature[field.name()]
                     add_text(data, "value", "" if value is None else value)
+
+            if layer_key == "distribution cable":
+                if extended is None:
+                    extended = ET.SubElement(placemark, qn("ExtendedData"))
+                distance_area = QgsDistanceArea()
+                distance_area.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+                ellipsoid = QgsProject.instance().ellipsoid()
+                if ellipsoid:
+                    distance_area.setEllipsoid(ellipsoid)
+                measured_length = distance_area.measureLength(geom)
+                if not math.isfinite(measured_length):
+                    raise ValueError(
+                        "Distribution Cable 要素 {} 的测量长度不是有效数值。".format(feature.id())
+                    )
+                data = ET.SubElement(
+                    extended, qn("Data"), {"name": "Measured Length (m)"}
+                )
+                add_text(data, "value", "{:.3f}".format(measured_length))
 
             geometry_node = geometry_to_kml(geom, transform)
             if geometry_node is not None:
