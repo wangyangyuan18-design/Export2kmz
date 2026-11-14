@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
+from html import escape as html_escape
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
@@ -1154,14 +1155,30 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None,
                             pass
                     description_value = str(value)
 
-            # Google Earth shows ExtendedData in the feature balloon, but its
-            # Properties editor may not expose those custom fields. Put the
-            # measured length in Description as well so it is visible there.
+            # Google Earth may not show ExtendedData in its right-click
+            # Properties editor. Mirror the measured length into Description.
             if measured_length is not None:
-                length_html = "Measured Length (m): {:.3f}".format(measured_length)
-                description_value = (
-                    (description_value + "<br/>") if description_value else ""
-                ) + "<b>{}</b>".format(length_html)
+                length_html = "<b>Measured Length (m): {:.3f}</b>".format(measured_length)
+                if desc_field:
+                    description_value = (
+                        (description_value + "<br/>") if description_value else ""
+                    ) + length_html
+                elif include_attributes:
+                    rows = []
+                    for field in layer.fields():
+                        raw_value = feature[field.name()]
+                        shown_value = "" if raw_value is None else str(raw_value)
+                        rows.append(
+                            "<tr><td>{}</td><td>{}</td></tr>".format(
+                                html_escape(field.name()), html_escape(shown_value)
+                            )
+                        )
+                    rows.append("<tr><td>Measured Length (m)</td><td>{:.3f}</td></tr>".format(
+                        measured_length
+                    ))
+                    description_value = "<table>{}</table>".format("".join(rows))
+                else:
+                    description_value = length_html
 
             if description_value is not None:
                 add_text(placemark, "description", description_value)
