@@ -1128,6 +1128,20 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None,
             add_text(placemark, "name", name_value)
             add_text(placemark, "styleUrl", "#" + style_id)
 
+            measured_length = None
+            if layer_key == "distribution cable":
+                distance_area = QgsDistanceArea()
+                distance_area.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+                ellipsoid = QgsProject.instance().ellipsoid()
+                if ellipsoid:
+                    distance_area.setEllipsoid(ellipsoid)
+                measured_length = distance_area.measureLength(geom)
+                if not math.isfinite(measured_length):
+                    raise ValueError(
+                        "Distribution Cable 要素 {} 的测量长度不是有效数值。".format(feature.id())
+                    )
+
+            description_value = None
             if desc_field:
                 value = feature[desc_field]
                 if value is not None:
@@ -1138,7 +1152,19 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None,
                                 value = str(int(round(number)))
                         except (TypeError, ValueError):
                             pass
-                    add_text(placemark, "description", value)
+                    description_value = str(value)
+
+            # Google Earth shows ExtendedData in the feature balloon, but its
+            # Properties editor may not expose those custom fields. Put the
+            # measured length in Description as well so it is visible there.
+            if measured_length is not None:
+                length_html = "Measured Length (m): {:.3f}".format(measured_length)
+                description_value = (
+                    (description_value + "<br/>") if description_value else ""
+                ) + "<b>{}</b>".format(length_html)
+
+            if description_value is not None:
+                add_text(placemark, "description", description_value)
 
             # Keep the selected Description behavior unchanged. For ordinary
             # attribute export, retain all source fields; Distribution Cable
@@ -1151,19 +1177,9 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None,
                     value = feature[field.name()]
                     add_text(data, "value", "" if value is None else value)
 
-            if layer_key == "distribution cable":
+            if measured_length is not None:
                 if extended is None:
                     extended = ET.SubElement(placemark, qn("ExtendedData"))
-                distance_area = QgsDistanceArea()
-                distance_area.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
-                ellipsoid = QgsProject.instance().ellipsoid()
-                if ellipsoid:
-                    distance_area.setEllipsoid(ellipsoid)
-                measured_length = distance_area.measureLength(geom)
-                if not math.isfinite(measured_length):
-                    raise ValueError(
-                        "Distribution Cable 要素 {} 的测量长度不是有效数值。".format(feature.id())
-                    )
                 data = ET.SubElement(
                     extended, qn("Data"), {"name": "Measured Length (m)"}
                 )
