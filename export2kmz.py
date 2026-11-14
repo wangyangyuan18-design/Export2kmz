@@ -532,16 +532,6 @@ class ExportDialog(QDialog):
                 type_index = group.findData(_field_name(layer, "Type") or "")
                 if type_index >= 0:
                     group.setCurrentIndex(type_index)
-            # Preserve the old default output: HOMES PASS layers sum UNITS;
-            # all other layers append feature counts.
-            layer_key = layer.name().strip().casefold()
-            if layer_key in {"sdus", "mdus", "church", "commercial", "hospitals", "institution"}:
-                units_index = sum_field.findData(_field_name(layer, "UNITS") or "")
-                if units_index >= 0:
-                    sum_field.setCurrentIndex(units_index)
-                    count_check.setChecked(False)
-                    sum_check.setChecked(True)
-
             self.controls.append({
                 "layer": layer, "count": count_check, "sum_enabled": sum_check,
                 "sum_field": sum_field, "group": group, "style": style,
@@ -551,7 +541,7 @@ class ExportDialog(QDialog):
                 lambda checked, r=row: self._count_toggled(r, checked))
             sum_check.toggled.connect(
                 lambda checked, r=row: self._sum_toggled(r, checked))
-            sum_field.currentIndexChanged.connect(lambda _i: self._sync_from_row(row))
+            sum_field.currentIndexChanged.connect(lambda _i, r=row: self._sync_from_row(r))
             desc.currentIndexChanged.connect(lambda _i, r=row: self._sync_from_row(r))
             sync_check.toggled.connect(lambda _checked, r=row: self._sync_from_row(r))
         self.table.resizeColumnsToContents()
@@ -566,6 +556,32 @@ class ExportDialog(QDialog):
         self.table.setColumnWidth(9, 110)
         self.table.setColumnWidth(10, 150)
         self.table.setColumnWidth(11, 85)
+
+    @staticmethod
+    def _set_statistics_state(item, count_enabled, sum_enabled, sum_field=None):
+        """Apply exactly the saved per-layer statistics choice without signal side effects."""
+        count_enabled = bool(count_enabled)
+        sum_enabled = bool(sum_enabled)
+        if count_enabled and sum_enabled:
+            raise ValueError(
+                "图层“{}”不能同时选择“要素数量”和“字段求和”。".format(
+                    item["layer"].name()
+                )
+            )
+
+        controls = (item["count"], item["sum_enabled"], item["sum_field"])
+        for widget in controls:
+            widget.blockSignals(True)
+        try:
+            item["count"].setChecked(count_enabled)
+            item["sum_enabled"].setChecked(sum_enabled)
+            if sum_field is not None:
+                index = item["sum_field"].findData(sum_field or "")
+                item["sum_field"].setCurrentIndex(index if index >= 0 else 0)
+            item["sum_field"].setEnabled(sum_enabled)
+        finally:
+            for widget in controls:
+                widget.blockSignals(False)
 
     def _count_toggled(self, row, checked):
         control = self.controls[row]
@@ -666,6 +682,7 @@ class ExportDialog(QDialog):
             for entry in config.get("layers", []):
                 saved_by_name.setdefault(entry.get("name"), []).append(entry)
             name_offsets = {}
+            statistics_warnings = []
             for row, item in enumerate(self.controls):
                 layer = item["layer"]
                 saved = saved_by_id.get(layer.id())
@@ -679,10 +696,18 @@ class ExportDialog(QDialog):
                     continue
                 self.table.item(row, 0).setCheckState(
                     Qt.Checked if saved.get("enabled", True) else Qt.Unchecked)
-                item["count"].setChecked(bool(saved.get("count_enabled", True)))
-                item["sum_enabled"].setChecked(
-                    bool(saved.get("sum_enabled", False)) and not item["count"].isChecked())
-                self._set_combo_data(item["sum_field"], saved.get("sum_field", ""))
+                count_on = bool(saved.get("count_enabled", True))
+                sum_on = bool(saved.get("sum_enabled", False))
+                if count_on and sum_on:
+                    statistics_warnings.append(
+                        "{}：旧配置同时启用了两种统计方式，已将两项都关闭，请重新选择。".format(
+                            layer.name()
+                        )
+                    )
+                    count_on = sum_on = False
+                self._set_statistics_state(
+                    item, count_on, sum_on, saved.get("sum_field", "")
+                )
                 self._set_combo_data(item["group"], saved.get("group_field", ""))
                 self._set_combo_text(item["style"], saved.get("style", "默认样式"))
                 self._set_combo_text(item["icon"], saved.get("icon", "默认"))
@@ -693,6 +718,10 @@ class ExportDialog(QDialog):
             self.output_path = config.get("output_path", "") or ""
             self.output.setText(self.output_path if self.output_path else "请选择 KMZ 保存位置")
             self.output.setToolTip(self.output_path)
+            if statistics_warnings:
+                QMessageBox.warning(
+                    self, "统计配置已校正", "\n".join(statistics_warnings)
+                )
         except Exception as exc:
             QMessageBox.warning(self, "配置恢复提示", "无法完整恢复工程配置：\n{}".format(exc))
 
@@ -789,11 +818,12 @@ class ExportDialog(QDialog):
                 self._set_combo_text(item["style"], saved.get("style", "默认样式"))
                 self._set_combo_text(item["icon"], saved.get("icon", "默认"))
                 self._set_combo_data(item["description"], saved.get("description_field", ""))
-                item["count"].setChecked(bool(saved.get("count_enabled", True)))
-                item["sum_enabled"].setChecked(
-                    bool(saved.get("sum_enabled", False)) and not item["count"].isChecked())
-                self._set_combo_data(item["sum_field"], saved.get("sum_field", ""))
-                item["sum_field"].setEnabled(item["sum_enabled"].isChecked())
+                self._set_statistics_state(
+                    item,
+                    bool(saved.get("count_enabled", True)),
+                    bool(saved.get("sum_enabled", False)),
+                    saved.get("sum_field", "")
+                )
                 item["sync"].setChecked(bool(saved.get("sync", False)))
             self.attrs.setChecked(bool(config.get("show_attributes", True)))
             self.output_path = config.get("output_path", "") or ""
@@ -830,25 +860,53 @@ class ExportDialog(QDialog):
         if not selected:
             QMessageBox.warning(self, "KMZ导出工具", "请至少选择一个图层。")
             return
+        export_items = []
         for item in selected:
-            if item["sum_enabled"].isChecked():
-                field_name = item["sum_field"].currentData() or ""
+            count_on = item["count"].isChecked()
+            sum_on = item["sum_enabled"].isChecked()
+            if count_on and sum_on:
+                QMessageBox.warning(
+                    self, "KMZ导出工具",
+                    "图层“{}”同时勾选了“要素数量”和“字段求和”。请只选择一种统计方式。".format(
+                        item["layer"].name()
+                    )
+                )
+                return
+
+            field_name = item["sum_field"].currentData() or ""
+            if sum_on:
                 if not field_name:
-                    QMessageBox.warning(self, "KMZ导出工具",
-                        "图层“{}”已启用字段求和，但没有选择求和字段。".format(item["layer"].name()))
+                    QMessageBox.warning(
+                        self, "KMZ导出工具",
+                        "图层“{}”已启用字段求和，但没有选择求和字段。".format(
+                            item["layer"].name()
+                        )
+                    )
                     return
                 try:
                     _sum_field(item["layer"], field_name)
                 except Exception as exc:
                     QMessageBox.warning(self, "KMZ导出工具", str(exc))
                     return
+
+            # Freeze the UI choice now. The KMZ writer receives plain values,
+            # not live QCheckBox/QComboBox objects.
+            export_items.append({
+                "layer": item["layer"],
+                "count_enabled": count_on,
+                "sum_enabled": sum_on,
+                "sum_field": field_name,
+                "group_field": item["group"].currentData() or "",
+                "description_field": item["description"].currentData() or ""
+            })
+
         self._save_project_config()
 
         progress = ExportProgressDialog(self)
         progress.show()
         QApplication.processEvents()
         try:
-            count, geometry_stats = export_kmz(path, selected, self.attrs.isChecked(), progress)
+            count, geometry_stats = export_kmz(path, export_items, self.attrs.isChecked(), progress)
             progress.setValue(100)
             progress.setLabelText("KMZ 文件已生成。")
             QApplication.processEvents()
@@ -888,11 +946,11 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
         for group_name in _layer_tree_path(layer):
             parent_folder = _ensure_kml_folder(parent_folder, group_name, folder_cache)
 
-        if item["count"].isChecked():
+        if item.get("count_enabled", False):
             layer_folder_name = "{}={}".format(layer.name(), layer.featureCount())
-        elif item["sum_enabled"].isChecked():
+        elif item.get("sum_enabled", False):
             layer_folder_name = "{}={}".format(
-                layer.name(), _sum_field(layer, item["sum_field"].currentData()))
+                layer.name(), _sum_field(layer, item.get("sum_field", "")))
         else:
             layer_folder_name = layer.name()
         layer_folder = _ensure_kml_folder(parent_folder, layer_folder_name, folder_cache)
@@ -924,10 +982,10 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
 
         transform = QgsCoordinateTransform(layer.crs(), target_crs, QgsProject.instance())
         is_sub_box = layer_key == "sub box"
-        group_field = _field_name(layer, "Type") if is_sub_box else (item["group"].currentData() or "")
+        group_field = _field_name(layer, "Type") if is_sub_box else (item.get("group_field", "") or "")
         if group_field and _field_name(layer, group_field) is None:
             group_field = ""
-        desc_field = item["description"].currentData() or ""
+        desc_field = item.get("description_field", "") or ""
 
         type_counts = _sub_box_type_counts(layer) if is_sub_box else {}
         group_folders = {}
