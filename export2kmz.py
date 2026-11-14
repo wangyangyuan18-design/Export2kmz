@@ -7,7 +7,6 @@ from decimal import Decimal, InvalidOperation, localcontext
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
-from html import escape as html_escape
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
@@ -19,7 +18,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsWkbTypes, QgsCoordinateReferenceSystem,
-    QgsCoordinateTransform, QgsGeometry, QgsDistanceArea
+    QgsCoordinateTransform, QgsGeometry
 )
 
 KML_NS = "http://www.opengis.net/kml/2.2"
@@ -1129,20 +1128,6 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None,
             add_text(placemark, "name", name_value)
             add_text(placemark, "styleUrl", "#" + style_id)
 
-            measured_length = None
-            if layer_key == "distribution cable":
-                distance_area = QgsDistanceArea()
-                distance_area.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
-                ellipsoid = QgsProject.instance().ellipsoid()
-                if ellipsoid:
-                    distance_area.setEllipsoid(ellipsoid)
-                measured_length = distance_area.measureLength(geom)
-                if not math.isfinite(measured_length):
-                    raise ValueError(
-                        "Distribution Cable 要素 {} 的测量长度不是有效数值。".format(feature.id())
-                    )
-
-            description_value = None
             if desc_field:
                 value = feature[desc_field]
                 if value is not None:
@@ -1153,54 +1138,13 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None,
                                 value = str(int(round(number)))
                         except (TypeError, ValueError):
                             pass
-                    description_value = str(value)
-
-            # Google Earth may not show ExtendedData in its right-click
-            # Properties editor. Mirror the measured length into Description.
-            if measured_length is not None:
-                length_html = "<b>Measured Length (m): {:.3f}</b>".format(measured_length)
-                if desc_field:
-                    description_value = (
-                        (description_value + "<br/>") if description_value else ""
-                    ) + length_html
-                elif include_attributes:
-                    rows = []
-                    for field in layer.fields():
-                        raw_value = feature[field.name()]
-                        shown_value = "" if raw_value is None else str(raw_value)
-                        rows.append(
-                            "<tr><td>{}</td><td>{}</td></tr>".format(
-                                html_escape(field.name()), html_escape(shown_value)
-                            )
-                        )
-                    rows.append("<tr><td>Measured Length (m)</td><td>{:.3f}</td></tr>".format(
-                        measured_length
-                    ))
-                    description_value = "<table>{}</table>".format("".join(rows))
-                else:
-                    description_value = length_html
-
-            if description_value is not None:
-                add_text(placemark, "description", description_value)
-
-            # Keep the selected Description behavior unchanged. For ordinary
-            # attribute export, retain all source fields; Distribution Cable
-            # additionally always receives a measured length field.
-            extended = None
-            if include_attributes and not desc_field:
+                    add_text(placemark, "description", value)
+            elif include_attributes:
                 extended = ET.SubElement(placemark, qn("ExtendedData"))
                 for field in layer.fields():
                     data = ET.SubElement(extended, qn("Data"), {"name": field.name()})
                     value = feature[field.name()]
                     add_text(data, "value", "" if value is None else value)
-
-            if measured_length is not None:
-                if extended is None:
-                    extended = ET.SubElement(placemark, qn("ExtendedData"))
-                data = ET.SubElement(
-                    extended, qn("Data"), {"name": "Measured Length (m)"}
-                )
-                add_text(data, "value", "{:.3f}".format(measured_length))
 
             geometry_node = geometry_to_kml(geom, transform)
             if geometry_node is not None:
