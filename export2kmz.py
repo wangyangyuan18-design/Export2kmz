@@ -245,6 +245,52 @@ def _normalize_sub_box_type(value):
     return label
 
 
+def _group_value_label(value):
+    """Return the same display key used by field-group folders."""
+    return "(空值)" if value is None or str(value).strip() == "" else str(value)
+
+
+def _sum_field_by_group(layer, sum_field_name, group_field_name, sub_box=False):
+    """Sum a numeric field independently for each value of the selected group field."""
+    actual_sum = _field_name(layer, sum_field_name) if sum_field_name else None
+    actual_group = _field_name(layer, group_field_name) if group_field_name else None
+    if not actual_sum:
+        raise ValueError("图层“{}”不存在求和字段“{}”。".format(layer.name(), sum_field_name))
+    if not actual_group:
+        raise ValueError("图层“{}”不存在分组字段“{}”。".format(layer.name(), group_field_name))
+
+    totals = {}
+    invalid = 0
+    for feature in layer.getFeatures():
+        raw_group = feature[actual_group]
+        group_label = (
+            _normalize_sub_box_type(raw_group)
+            if sub_box else _group_value_label(raw_group)
+        )
+        # Create zero-valued entries too, so blank-valued groups still display =0.
+        totals.setdefault(group_label, 0.0)
+
+        value = feature[actual_sum]
+        if value is None or str(value).strip() == "":
+            continue
+        try:
+            number = float(value)
+            if math.isfinite(number):
+                totals[group_label] += number
+            else:
+                invalid += 1
+        except (TypeError, ValueError):
+            invalid += 1
+
+    if invalid:
+        raise ValueError(
+            "图层“{}”字段“{}”包含 {} 个非数值内容，无法完成分组求和。".format(
+                layer.name(), actual_sum, invalid
+            )
+        )
+    return {label: _format_number(total) for label, total in totals.items()}
+
+
 def _sub_box_type_counts(layer):
     """Count SUB BOX features by the Type field, including null values."""
     type_field = _field_name(layer, "Type")
@@ -1000,9 +1046,17 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
         transform = QgsCoordinateTransform(layer.crs(), target_crs, QgsProject.instance())
         is_sub_box = layer_key == "sub box"
         group_field = _field_name(layer, "Type") if is_sub_box else (item.get("group_field", "") or "")
-        if group_field and _field_name(layer, group_field) is None:
-            group_field = ""
+        group_field = _field_name(layer, group_field) if group_field else ""
         desc_field = item.get("description_field", "") or ""
+
+        sum_enabled = bool(item.get("sum_enabled", False))
+        sum_field = item.get("sum_field", "") or ""
+        # Keep the layer-folder total above, and also calculate a subtotal for
+        # every child folder created from the selected "字段分组" field.
+        group_sums = (
+            _sum_field_by_group(layer, sum_field, group_field, is_sub_box)
+            if sum_enabled and group_field else {}
+        )
 
         type_counts = _sub_box_type_counts(layer) if is_sub_box else {}
         group_folders = {}
@@ -1017,6 +1071,10 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
             for label in type_labels:
                 count = type_counts.get(label, 0)
                 folder_name = "{}={}".format(label, count)
+                if sum_enabled:
+                    folder_name += " | {}={}".format(
+                        sum_field, group_sums.get(label, "0")
+                    )
                 group_folders[label] = _ensure_kml_folder(layer_folder, folder_name, {})
 
         for feature in layer.getFeatures():
@@ -1045,14 +1103,23 @@ def export_kmz(output_path, selected, include_attributes=True, progress=None):
                     folder_label = group_name
                     if group_name not in group_folders:
                         count = type_counts.get(group_name, 0)
+                        folder_name = "{}={}".format(folder_label, count)
+                        if sum_enabled:
+                            folder_name += " | {}={}".format(
+                                sum_field, group_sums.get(group_name, "0")
+                            )
                         group_folders[group_name] = _ensure_kml_folder(
-                            layer_folder, "{}={}".format(folder_label, count), {}
+                            layer_folder, folder_name, {}
                         )
                 else:
-                    group_name = "(空值)" if raw_group is None or str(raw_group).strip() == "" else str(raw_group)
+                    group_name = _group_value_label(raw_group)
                     if group_name not in group_folders:
+                        folder_name = (
+                            "{}={}".format(group_name, group_sums.get(group_name, "0"))
+                            if sum_enabled else group_name
+                        )
                         group_folders[group_name] = _ensure_kml_folder(
-                            layer_folder, group_name, {}
+                            layer_folder, folder_name, {}
                         )
                 feature_parent = group_folders[group_name]
 
