@@ -2,7 +2,7 @@
 name=Export2KMZ
 qgisMinimumVersion=3.16
 description=Export QGIS vector layers to KMZ with user-selected per-layer feature counts or numeric field sums.
-version=1.1.1
+version=1.1.2
 author=Export2KMZ contributors
 email=
 about=Exports selected QGIS vector layers to Google Earth KMZ while preserving QGIS group hierarchy. For each layer, the user selects feature count, a numeric field sum, or no statistic. SUB BOX Type category counts are retained.
