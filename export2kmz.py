@@ -670,14 +670,25 @@ class ExportDialog(QDialog):
             return
         try:
             project = QgsProject.instance()
-            project.setCustomProperty("Export2KMZ/config_v2",
-                                      json.dumps(self._config_payload(), ensure_ascii=False))
+            # Persist the JSON in the QGIS project file using QgsProject's
+            # supported settings API (QGIS 3.x).
+            written = project.writeEntry(
+                "Export2KMZ", "config_v2",
+                json.dumps(self._config_payload(), ensure_ascii=False)
+            )
+            if written is False:
+                raise RuntimeError("QGIS 工程配置写入失败。")
             project.setDirty(True)
         except Exception as exc:
             print("Export2KMZ 配置保存失败：{}".format(exc))
 
     def _load_project_config(self):
-        raw = QgsProject.instance().customProperty("Export2KMZ/config_v2", "")
+        project = QgsProject.instance()
+        # QgsProject stores plugin settings through readEntry/writeEntry.
+        # customProperty/setCustomProperty belong to QgsMapLayer/QgsLayerTreeNode,
+        # not QgsProject.
+        read_result = project.readEntry("Export2KMZ", "config_v2", "")
+        raw = read_result[0] if isinstance(read_result, (tuple, list)) else read_result
         if not raw:
             return
         try:
