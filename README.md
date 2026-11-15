@@ -7,6 +7,7 @@ Exports selected vector layers from the current QGIS project to a Google Earth K
 - Reprojects output coordinates to EPSG:4326.
 - Preserves the existing QGIS layer-tree group hierarchy in KML/KMZ.
 - Per-layer statistics are user-controlled: select `要素数量` to append the feature count, select `字段求和` plus a numeric field to append its sum, or uncheck both to append no statistic. The two modes are mutually exclusive.
+- When `字段求和` and `字段分组` are both selected, the parent layer folder shows the whole-layer sum and each child field-group folder shows that group's subtotal.
 - For `SUB BOX`, counts features by the `Type` field and writes compact child Folder names such as `SUB BOX(70/30)=8`, `SUB BOX(50/50)=4`, and `END BOX=4`.
 - The same controls apply to all layer types, including HOMES PASS layers and Feeder Cable; no layer name is hard-wired to a particular statistic.
 - Retains the layer's existing placemark Name, geometry, selected Description field, and optional ExtendedData attributes.
@@ -14,7 +15,7 @@ Exports selected vector layers from the current QGIS project to a Google Earth K
 - Supports style templates and per-layer Description field selection.
 
 ## ODN naming rules
-- Example: `Sdus=1010` when `字段求和` + `UNITS` is selected; `Feeder Cable=12345.6` when `字段求和` + `length` is selected.
+- Examples: `Sdus=1010` when `字段求和` + `UNITS` is selected; with `Feeder Cable` grouped by `HUB`, the parent can show `Feeder Cable=12345.6` while its child folders show `HUB-A=5000.2`, `HUB-B=7345.4` (illustrative values).
 - SUB BOX parent: `SUB BOX=feature_count`
 - SUB BOX Type children: `SUB BOX(70/30)=count`, `SUB BOX(50/50)=count`, `END BOX=count`
 - Any layer can use either statistic or no statistic, according to its current checkbox selection.
